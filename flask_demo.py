@@ -4,6 +4,7 @@ import os
 import json
 import collections
 import pickle
+from glob import glob
 import pandas as pd
 
 app = Flask(__name__, template_folder='flask_temp', static_folder='CF_data')
@@ -14,6 +15,8 @@ hate_score = -0.5
 topk = 20
 return_num = 10
 rating_to_tag = 0.4
+max_rev_toks = 70000
+rev_rep = 5
 
 # @app.route('/')
 # def index():
@@ -30,6 +33,7 @@ piv_map = {piv_anime['anime_id'][i]: {'name': piv_anime['name'][i],
                                       'type': piv_anime['type'][i],
                                       'rating': piv_anime['rating'][i],
                                       'piv_idx': i} for i in range(piv_anime.shape[0])}
+valid_type = {'TV', 'OVA', 'Movie'}
 print('Loading Tags...')
 unique_tags = []
 for tag in anime_info['genre'].values:
@@ -51,8 +55,36 @@ for anime_id in piv_map:
         tags = tags.split(',')
         for tag in tags:
             tag_matrix[piv_idx, tag_map[tag.strip()]] = 1.0
-print(tag_matrix)
 print('Tags loading over...')
+# load reviews
+print('Loading reviews...')
+reviews_list = glob('archive/reviews_tfidf/*.json')
+word_count = collections.defaultdict(int)
+review_map = {}
+review_map_rev = {}
+review_map_rev_name = {}
+for i, r in enumerate(reviews_list):
+    rid = int(r.split('/')[-1].split('_')[0])
+    d = json.load(open(r))
+    for w in d:
+        word_count[w[0]] += 1
+    review_map[rid] = i
+    review_map_rev[i] = rid
+    review_map_rev_name[i] = r.split('/')[-1].split('.')[0]
+word_count = [(k, v) for k, v in word_count.items()]
+word_count.sort(key=lambda x: x[1], reverse=True)
+word_count = word_count[:max_rev_toks]
+review_mat = np.zeros((len(reviews_list), len(word_count)))
+review_word_map = {}
+review_word_rev_map = {}
+for i, w in enumerate(word_count):
+    review_word_map[w[0]] = i
+    review_word_rev_map[i] = w[0]
+for i, r in enumerate(reviews_list):
+    d = json.load(open(r))
+    for w in d:
+        if w[0] in review_word_map:
+            review_mat[i, review_word_map[w[0]]] = w[1]
 print('Init over...')
 
 
@@ -63,6 +95,7 @@ def get_rec():
     print('Recieve', user_info)
     user_vec = np.zeros([1, 5479])
     user_tags = np.zeros([1, len(unique_tags) + 1])
+    user_reviews = np.zeros([1, len(review_word_map)])
     for anime_id in user_info:
         anime_id_int = int(anime_id)
         if anime_id_int not in piv_map:
@@ -73,6 +106,8 @@ def get_rec():
             user_vec[0, piv_map[anime_id_int]['piv_idx']] = like_score
             # 喜欢的话，追加tag
             user_tags[0, :] += tag_matrix[piv_map[anime_id_int]['piv_idx'], :]
+            if anime_id_int in review_map:
+                user_reviews[0, :] += review_mat[review_map[anime_id_int], :]
         elif user_info[anime_id] == 0:
             user_vec[0, piv_map[anime_id_int]['piv_idx']] = hate_score
         else:
@@ -86,6 +121,16 @@ def get_rec():
             print(tag_map_rev[uts], user_tags[0, uts])
     user_tags = user_tags / np.max(user_tags)
     user_tags[0, -1] = rating_to_tag
+    # 输出用户review关键词
+    user_reviews_sorted = np.argsort(user_reviews[0])[::-1]
+    # review逐过滤
+    user_reviews = np.tile(user_reviews, [rev_rep, 1])
+    print('User keywords in reviews:')
+    for i, urs in enumerate(user_reviews_sorted[:20]):
+        if i + 1 < rev_rep:
+            user_reviews[i + 1:, urs] = 0
+        if user_reviews[0, urs] > 0:
+            print(review_word_rev_map[urs], user_reviews[0, urs])
 
     # 根据协同过滤，近似用户推荐共同爱好
     sim_scores = np.matmul(user_vec, piv_norm.values)
@@ -100,7 +145,7 @@ def get_rec():
     for i in range(topk_index.shape[0]):
         for j in range(topk_index.shape[1]):
             target_i = topk_index[i, j]
-            if topk_mat_values[target_i, j] > 0:
+            if topk_mat_values[target_i, j] > 0 and piv_anime['type'][target_i] in valid_type:
                 fc_rec_list[str(piv_anime['anime_id'][target_i])] += 1
     fc_rec_list = sorted([(k, piv_map[int(k)]['name'], v / topk) for k, v in fc_rec_list.items() if k not in user_info],
                          key=lambda x: x[-1], reverse=True)
@@ -115,7 +160,9 @@ def get_rec():
         target_i = tag_scores_argsort[idx]
         idx += 1
         target_id = str(piv_anime['anime_id'][target_i])
-        if target_id in user_info:
+        if int(target_id) not in piv_map:
+            continue
+        if target_id in user_info or piv_map[int(target_id)]['type'] not in valid_type:
             continue
         target_name = piv_anime['name'][target_i]
         target_genre = piv_anime['genre'][target_i]
@@ -123,10 +170,33 @@ def get_rec():
 
         tag_rec_list.append((target_id, target_name, target_score, target_genre))
 
-    res = {'fc_rec': fc_rec_list, 'tag_rec': tag_rec_list}
+    # 根据评论获取
+    review_scores = np.matmul(review_mat, user_reviews.transpose())  # [anime_num, rev_rep]
+    review_scores_argsort = np.argsort(review_scores, axis=0)[::-1, :]
+    rev_rec_list = []
+    rev_set = set()
+    for i in range(rev_rep):
+        idx = 0
+        subidx = 0
+        # 循环rev_rep次，每次
+        while subidx < (return_num // rev_rep) and idx < len(review_scores_argsort):
+            target_i = review_scores_argsort[idx, i]
+            idx += 1
+            target_id = str(review_map_rev[target_i])
+            if int(target_id) not in piv_map:
+                continue
+            if target_id in user_info or target_id in rev_set or piv_map[int(target_id)]['type'] not in valid_type:
+                continue
+            rev_set.add(target_id)
+            subidx += 1
+            target_name = review_map_rev_name[target_i]
+            target_score = review_scores[target_i, i]
+            rev_rec_list.append((target_id, target_name, target_score))
+
+    res = {'fc_rec': fc_rec_list, 'tag_rec': tag_rec_list, 'rev_rec': rev_rec_list}
 
     return jsonify(res)
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8088)
+    app.run(host='0.0.0.0', port=8089)

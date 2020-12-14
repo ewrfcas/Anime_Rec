@@ -1,4 +1,4 @@
 # Anime_Recommendation
 Anime Recommendation System with reviews 
 
-Electra-base imdb test: 0.95804
+Acc of Electra-Base on imdb-test: 0.95804
