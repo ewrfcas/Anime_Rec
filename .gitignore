@@ -6,3 +6,7 @@
 /raw_data/
 /aclImdb/
 /archive/reviews_outputs/
+/archive/cv_staff_data.json
+/archive/cv_staff_mapping.json
+/archive/review_data.json
+/archive/review_word_map.json

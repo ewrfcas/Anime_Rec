@@ -1,29 +1,27 @@
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, request, jsonify
 import numpy as np
 import os
 import json
 import collections
 import pickle
-from glob import glob
 import pandas as pd
 
 app = Flask(__name__, template_folder='flask_temp', static_folder='CF_data')
 
-piv_norm_path = os.path.join(app.static_folder, 'piv_norm.pkl')
 like_score = 0.7
 hate_score = -0.5
 topk = 20
 return_num = 10
 rating_to_tag = 0.4
-max_rev_toks = 70000
-rev_rep = 5
-
-# @app.route('/')
-# def index():
-#     return render_template('index.html')
+rev_rep = 5  # review repeat times
+main_score = 2.0
+sup_score = 1.0
+staff_score = 0.3
+rating_to_cv = 0.2
+piv_norm_path = os.path.join('CF_data', 'piv_norm.pkl')
 
 print('Loading data...')
-anime_info = pd.read_csv('archive/anime.csv')
+anime_info = pd.read_csv(os.path.join('archive', 'anime.csv'))
 piv_norm = pickle.load(open(piv_norm_path, 'rb'))
 print('Index mapping...')
 piv_anime = pd.DataFrame(piv_norm.index)
@@ -55,36 +53,51 @@ for anime_id in piv_map:
         tags = tags.split(',')
         for tag in tags:
             tag_matrix[piv_idx, tag_map[tag.strip()]] = 1.0
-print('Tags loading over...')
+
 # load reviews
 print('Loading reviews...')
-reviews_list = glob('archive/reviews_tfidf/*.json')
-word_count = collections.defaultdict(int)
-review_map = {}
-review_map_rev = {}
-review_map_rev_name = {}
-for i, r in enumerate(reviews_list):
-    rid = int(r.split('/')[-1].split('_')[0])
-    d = json.load(open(r))
-    for w in d:
-        word_count[w[0]] += 1
-    review_map[rid] = i
-    review_map_rev[i] = rid
-    review_map_rev_name[i] = r.split('/')[-1].split('.')[0]
-word_count = [(k, v) for k, v in word_count.items()]
-word_count.sort(key=lambda x: x[1], reverse=True)
-word_count = word_count[:max_rev_toks]
-review_mat = np.zeros((len(reviews_list), len(word_count)))
-review_word_map = {}
+review_data = json.load(open(os.path.join('archive', 'review_data.json')))
+review_word_map = json.load(open(os.path.join('archive', 'review_word_map.json')))
 review_word_rev_map = {}
-for i, w in enumerate(word_count):
-    review_word_map[w[0]] = i
-    review_word_rev_map[i] = w[0]
-for i, r in enumerate(reviews_list):
-    d = json.load(open(r))
-    for w in d:
+for w in review_word_map:
+    review_word_rev_map[review_word_map[w]] = w
+review_map = {}
+review_rev_map = {}
+review_mat = []
+for i, name in enumerate(review_data):
+    rid = int(name.split('_')[0])
+    review_map[rid] = i
+    review_rev_map[i] = name
+    rm = np.zeros((1, len(review_word_map)))
+    for w in review_data[name]:
         if w[0] in review_word_map:
-            review_mat[i, review_word_map[w[0]]] = w[1]
+            rm[0, review_word_map[w[0]]] = w[1]
+    review_mat.append(rm)
+review_mat = np.concatenate(review_mat, axis=0)
+
+# load cv staff
+print('Loading cv staffs...')
+cv_staff_data = json.load(open(os.path.join('archive', 'cv_staff_data.json')))
+cv_anime_map = {}
+cv_anime_rev_map = {}
+cvstaff_map = json.load(open(os.path.join('archive', 'cv_staff_mapping.json')))
+cvstaff_rev_map = {}
+cvstaff_mat = np.zeros((len(cv_staff_data), len(cvstaff_map)))
+for name in cvstaff_map:
+    cvstaff_rev_map[cvstaff_map[name]] = name
+for i, name in enumerate(cv_staff_data):
+    rid = int(name.split('/')[-1].split('_')[0])
+    cv_anime_map[rid] = i
+    cv_anime_rev_map[i] = name
+    # 主角CV
+    for cv_name in cv_staff_data[name]['main']:
+        cvstaff_mat[i, cvstaff_map[cv_name]] = main_score
+    # 配角CV
+    for cv_name in cv_staff_data[name]['sup']:
+        cvstaff_mat[i, cvstaff_map[cv_name]] = sup_score
+    # staff
+    for staff_name in cv_staff_data[name]['staff']:
+        cvstaff_mat[i, cvstaff_map[staff_name]] = staff_score
 print('Init over...')
 
 
@@ -96,6 +109,7 @@ def get_rec():
     user_vec = np.zeros([1, 5479])
     user_tags = np.zeros([1, len(unique_tags) + 1])
     user_reviews = np.zeros([1, len(review_word_map)])
+    user_cvstaff = np.zeros([1, len(cvstaff_map)])
     for anime_id in user_info:
         anime_id_int = int(anime_id)
         if anime_id_int not in piv_map:
@@ -108,6 +122,8 @@ def get_rec():
             user_tags[0, :] += tag_matrix[piv_map[anime_id_int]['piv_idx'], :]
             if anime_id_int in review_map:
                 user_reviews[0, :] += review_mat[review_map[anime_id_int], :]
+            if anime_id_int in cv_anime_map:
+                user_cvstaff[0, :] += cvstaff_mat[cv_anime_map[anime_id_int], :]
         elif user_info[anime_id] == 0:
             user_vec[0, piv_map[anime_id_int]['piv_idx']] = hate_score
         else:
@@ -123,7 +139,7 @@ def get_rec():
     user_tags[0, -1] = rating_to_tag
     # 输出用户review关键词
     user_reviews_sorted = np.argsort(user_reviews[0])[::-1]
-    # review逐过滤
+    # review逐条过滤
     user_reviews = np.tile(user_reviews, [rev_rep, 1])
     print('User keywords in reviews:')
     for i, urs in enumerate(user_reviews_sorted[:20]):
@@ -131,6 +147,12 @@ def get_rec():
             user_reviews[i + 1:, urs] = 0
         if user_reviews[0, urs] > 0:
             print(review_word_rev_map[urs], user_reviews[0, urs])
+    # 输出用户偏爱的CV和STAFF
+    user_cvstaff_sorted = np.argsort(user_cvstaff[0])[::-1]
+    print('User favourite cv&staff:')
+    for ucs in user_cvstaff_sorted[:10]:
+        if user_cvstaff[0, ucs] > 0:
+            print(cvstaff_rev_map[ucs], user_cvstaff[0, ucs])
 
     # 根据协同过滤，近似用户推荐共同爱好
     sim_scores = np.matmul(user_vec, piv_norm.values)
@@ -182,18 +204,35 @@ def get_rec():
         while subidx < (return_num // rev_rep) and idx < len(review_scores_argsort):
             target_i = review_scores_argsort[idx, i]
             idx += 1
-            target_id = str(review_map_rev[target_i])
+            target_id = str(review_rev_map[target_i].split('_')[0])
             if int(target_id) not in piv_map:
                 continue
             if target_id in user_info or target_id in rev_set or piv_map[int(target_id)]['type'] not in valid_type:
                 continue
             rev_set.add(target_id)
             subidx += 1
-            target_name = review_map_rev_name[target_i]
+            target_name = review_rev_map[target_i]
             target_score = review_scores[target_i, i]
             rev_rec_list.append((target_id, target_name, target_score))
 
-    res = {'fc_rec': fc_rec_list, 'tag_rec': tag_rec_list, 'rev_rec': rev_rec_list}
+    # 获取cv，staff相关推荐
+    cvstaff_scores = np.matmul(cvstaff_mat, user_cvstaff.transpose())[:, 0]  # [anime_num,1]->[anime_um,]
+    cvstaff_scores_argsort = np.argsort(cvstaff_scores)[::-1]
+    cvstaff_rec_list = []
+    idx = 0
+    while len(cvstaff_rec_list) < return_num and idx < len(cvstaff_scores_argsort):
+        target_i = cvstaff_scores_argsort[idx]
+        idx += 1
+        target_name = cv_anime_rev_map[target_i]
+        target_id = target_name.split('_')[0]
+        if target_id in user_info:
+            continue
+        target_score = cvstaff_scores[target_i]
+        target_cvs = cv_staff_data[target_name]['main'] + cv_staff_data[target_name]['sup']
+
+        cvstaff_rec_list.append((target_id, target_name, target_score, target_cvs))
+
+    res = {'fc_rec': fc_rec_list, 'tag_rec': tag_rec_list, 'rev_rec': rev_rec_list, 'cvstaff_rec': cvstaff_rec_list}
 
     return jsonify(res)
 
